@@ -68,6 +68,7 @@ npm run dev
 | 版本兼容 | `version_compat` | 版本映射 | 映射编号、关联API、旧版本 |
 | 批量查询 | `batch_query` | 批量任务 | 任务编号、关联API、查询清单 |
 | SDK配置 | `sdk_config` | SDK配置 | 配置编号、关联API、SDK语言 |
+| 账期更正 | `billing_correction` | 账期更正明细 | 更正编号、原账单编号、账期 |
 
 ## 约定
 
@@ -76,6 +77,26 @@ npm run dev
   `frontend/src/domain/<模块>.ts`，用于承载真实业务差异并维持36题位容量。
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
+
+## 账期更正与重新结算
+
+原「完成结算」只覆盖首次汇总；误结后的重新核算走 `billing_correction` 模块：
+
+- **版本化凭证**：`data/usage/settlements/<账期>.json` 按版本追加结算凭证，
+  `GET /api/usage_billing/settlements/{账期}/versions/{版本}` 可按原版本取数，
+  原已出账明细的 `billed_amount` 不会被再次收取。
+- **更正用量**：`POST /api/billing_correction/apply` 逐条登记来源调用，
+  每条用量同时关联「原账单编号 + 来源调用编号」；同一来源调用只入账一次，
+  `idempotency_key` 重放直接返回原更正单。
+- **状态流转**：`草稿 → 已申请 → 确认中 → 已确认 → 已通知`，可 `中断更正`
+  后用 `恢复更正` 从断点继续；已完成的步骤记录在更正单里，不会重复结算。
+- **金额凭据**：确认时只对本次修订金额追加结算版本，凭证行区分 `usage` /
+  `correction`，先前确认的用量与本次修订都可逐行核对。
+- **对账通知**：`POST /api/billing_correction/{id}/notify` 向对账方再发结果，
+  记录 `reopen_required` 与 `重开追踪`，并用 `GET
+  /api/usage_billing/settlements/{账期}/reconciliation` 复核两次结算的实际应收差额。
+
+回归测试：`cd backend && .venv/bin/python -m pytest -q tests/`
 
 领域：数据工程
 子方向：数据分析与数据应用

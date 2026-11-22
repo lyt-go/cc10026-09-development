@@ -59,3 +59,43 @@ export async function loadOverview(): Promise<OverviewResult> {
   if (!response.ok) throw new Error('运营概览读取失败')
   return await response.json()
 }
+
+export type SettlementVersion = {
+  version: number
+  settlement_no: string
+  kind: string
+  previous_total_amount: number
+  incremental_amount: number
+  total_amount: number
+  correction_id: number | null
+  settled_at: string
+}
+
+export type ReconciliationNotice = {
+  notice_id: number
+  notice_no: string
+  incremental_amount: number
+  reopen_required: boolean
+  remark: string
+}
+
+export type Reconciliation = {
+  billing_cycle: string
+  reopened: boolean
+  current_version: number
+  actual_receivable: number
+  versions: SettlementVersion[]
+  notices: ReconciliationNotice[]
+}
+
+export async function loadReconciliation(billingCycle: string): Promise<Reconciliation> {
+  const response = await request(
+    `/api/usage_billing/settlements/${encodeURIComponent(billingCycle)}/reconciliation`,
+  )
+  if (!response.ok) throw new Error('账期结算记录读取失败')
+  const payload = await response.json()
+  return {
+    ...payload,
+    current_version: payload.versions?.length ?? 0,
+  }
+}

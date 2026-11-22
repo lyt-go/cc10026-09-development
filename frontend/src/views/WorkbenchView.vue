@@ -90,6 +90,46 @@
       <span>共 {{ total }} 条{{ meta.name }}记录</span>
       <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
     </footer>
+
+    <section v-if="meta.key === 'usage_billing'" class="correction-panel">
+      <h3>结算版本与账期更正</h3>
+      <p class="page-desc">结算按账期版本化追加，旧版本可按原样取数；更正只对修订部分出账。</p>
+      <form class="filter-bar" @submit.prevent="loadSettlement">
+        <label class="filter-item">
+          <span>账期</span>
+          <input v-model="settlementCycle" data-testid="settlement-cycle" placeholder="如 2026-10" />
+        </label>
+        <button class="btn" data-testid="load-settlement" type="submit">查看结算版本</button>
+      </form>
+      <div v-if="settlement" class="settlement-summary">
+        <span>当前版本：v{{ settlement.current_version }}</span>
+        <span>实际应收：{{ settlement.actual_receivable }}</span>
+        <span>{{ settlement.reopened ? '账期需重开' : '账期无需重开' }}</span>
+      </div>
+      <table v-if="settlement" class="data-table">
+        <thead>
+          <tr><th>版本</th><th>结算编号</th><th>类型</th><th>上次金额</th><th>本次增量</th><th>累计金额</th><th>更正单</th></tr>
+        </thead>
+        <tbody>
+          <tr v-for="item in settlement.versions" :key="item.settlement_no" :data-testid="`version-${item.version}`">
+            <td>v{{ item.version }}</td>
+            <td>{{ item.settlement_no }}</td>
+            <td>{{ item.kind }}</td>
+            <td>{{ item.previous_total_amount }}</td>
+            <td>{{ item.incremental_amount }}</td>
+            <td>{{ item.total_amount }}</td>
+            <td>{{ item.correction_id ?? '—' }}</td>
+          </tr>
+        </tbody>
+      </table>
+      <div v-if="settlement?.notices?.length" class="notice-list">
+        <h4>对账通知</h4>
+        <p v-for="notice in settlement.notices" :key="notice.notice_id">
+          {{ notice.notice_no }} · 增量 {{ notice.incremental_amount }} ·
+          {{ notice.reopen_required ? '需重开账期' : '无需重开' }} · {{ notice.remark || '无备注' }}
+        </p>
+      </div>
+    </section>
   </section>
 </template>
 
@@ -100,13 +140,17 @@ import {
   createEntry,
   downloadEntries,
   listEntries,
+  loadReconciliation,
   moduleMeta,
   runAction as applyAction,
 } from '@/api/backend-service'
+import type { Reconciliation } from '@/api/backend-service'
 import type { EntryRow } from '@/data/types'
 
 const props = defineProps<{ moduleKey: string }>()
 const meta = moduleMeta(props.moduleKey)
+const settlementCycle = ref('')
+const settlement = ref<Reconciliation | null>(null)
 const rows = ref<EntryRow[]>([])
 const total = ref(0)
 const errorMessage = ref('')
@@ -184,6 +228,20 @@ async function reload() {
     total.value = payload.total
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '业务列表读取失败'
+  }
+}
+
+async function loadSettlement() {
+  errorMessage.value = ''
+  const cycle = settlementCycle.value.trim()
+  if (!cycle) {
+    errorMessage.value = '请先填写账期，例如 2026-10'
+    return
+  }
+  try {
+    settlement.value = await loadReconciliation(cycle)
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '结算记录读取失败'
   }
 }
 

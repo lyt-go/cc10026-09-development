@@ -5,7 +5,8 @@
 - 消费 subscription 共享快照 → 审批通过后初始化用量
 - 消费 rate_limiter 快照 → 超限写入用量异常
 - 写入 data/usage/ 共享文件 → call_audit 消费审计
-- 计费周期结束后触发结算 → 写入结算汇总
+- 计费周期结束后触发结算 → 按版本写入结算凭证
+- 账期更正明细（billing_correction）→ 只对修订部分追加结算版本
 """
 from __future__ import annotations
 
@@ -26,8 +27,13 @@ class UsageBillingService(BaseModuleService):
     NEGATIVE_ACTIONS = []
 
     def record_usage(self, api_name: str, caller: str, call_count: int = 1,
-                     data_rows: int = 0, amount: float = 0.0) -> dict[str, Any]:
-        """记录一次API调用用量。"""
+                     data_rows: int = 0, amount: float = 0.0,
+                     source_call_id: str | None = None) -> dict[str, Any]:
+        """记录一次API调用用量。
+
+        `source_call_id` 给定时按来源调用去重：同一来源调用只累计一次，
+        避免迟到的调用明细在重放时被重复计费。
+        """
         from app.services.data_manager import write_usage
         from app.store import store as s
 
@@ -37,12 +43,17 @@ class UsageBillingService(BaseModuleService):
         for row in rows:
             if (row.get("API名称") == api_name and row.get("调用方") == caller
                     and row.get("计费周期") == billing_cycle):
+                if source_call_id and source_call_id in (
+                        row.get("source_call_ids") or []):
+                    return row
                 old_count = int(row.get("调用次数", "0") or 0)
                 old_rows = int(row.get("数据行数", "0") or 0)
                 old_amount = float(row.get("费用金额", 0) or 0)
                 row["调用次数"] = str(old_count + call_count)
                 row["数据行数"] = str(old_rows + data_rows)
                 row["费用金额"] = old_amount + amount
+                if source_call_id:
+                    row.setdefault("source_call_ids", []).append(source_call_id)
                 write_usage(row.get("id", 0), {
                     "usage_id": row.get("id"),
                     "record_no": row.get("记录编号"),
@@ -53,6 +64,7 @@ class UsageBillingService(BaseModuleService):
                     "amount": old_amount + amount,
                     "billing_cycle": billing_cycle,
                     "settlement_status": row.get("status"),
+                    "source_call_ids": row.get("source_call_ids", []),
                 })
                 return row
 
@@ -71,6 +83,7 @@ class UsageBillingService(BaseModuleService):
             "status": self.STATUS_ORDER[0],
             "pending": True,
             "abnormal": False,
+            "source_call_ids": [source_call_id] if source_call_id else [],
         }
         rows.append(new_record)
         write_usage(new_id, {
@@ -83,6 +96,7 @@ class UsageBillingService(BaseModuleService):
             "amount": amount,
             "billing_cycle": billing_cycle,
             "settlement_status": self.STATUS_ORDER[0],
+            "source_call_ids": [source_call_id] if source_call_id else [],
         })
         return new_record
 
@@ -96,7 +110,9 @@ class UsageBillingService(BaseModuleService):
         if action == "完成结算" and entry:
             from app.services.data_manager import settle_billing
             billing_cycle = entry.get("计费周期", self._current_billing_cycle())
-            settlement = settle_billing(billing_cycle, use_auto_settlement=True)
+            settlement = settle_billing(
+                billing_cycle, use_auto_settlement=True,
+                idempotency_key=f"usage:{entry.get('id')}:{action}")
 
             # 联动增强：结算完成写入调用审计记录
             from app.services.data_manager import write_audit, DATA_ROOT
@@ -107,6 +123,9 @@ class UsageBillingService(BaseModuleService):
                 "caller": entry.get("调用方", ""),
                 "event": "billing_settled",
                 "billing_cycle": billing_cycle,
+                "settlement_no": settlement.get("settlement_no"),
+                "settlement_version": settlement.get("version"),
+                "incremental_amount": settlement.get("incremental_amount", 0),
                 "total_amount": settlement.get("total_amount", 0),
                 "total_calls": settlement.get("total_calls", 0),
             })
@@ -115,11 +134,27 @@ class UsageBillingService(BaseModuleService):
         write_module_snapshot(self.MODULE, self.domain_snapshot())
         return result
 
+    def settle_cycle(
+        self, billing_cycle: str, *, idempotency_key: str | None = None
+    ) -> dict[str, Any]:
+        """从用量计量侧发起账期结算；重复请求按幂等键返回已有版本。"""
+        from app.services.data_manager import settle_billing
+        settlement = settle_billing(
+            billing_cycle, use_auto_settlement=True,
+            idempotency_key=idempotency_key)
+        from app.services.data_manager import write_module_snapshot
+        write_module_snapshot(self.MODULE, self.domain_snapshot())
+        return settlement
+
     def _current_billing_cycle(self) -> str:
         from datetime import datetime, timedelta, timezone
         return datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m")
 
     def domain_snapshot(self) -> dict[str, Any]:
+        from app.services.data_manager import (
+            list_reconciliation_notices, list_usage, read_settlement_record,
+        )
+
         rows = store.rows(self.MODULE)
         usage_list = []
         for row in rows:
@@ -134,6 +169,42 @@ class UsageBillingService(BaseModuleService):
                 "amount": row.get("费用金额"),
                 "status": row.get("status"),
             })
+
+        # 结算凭证按账期版本化输出，供账期更正核对和下游对账消费。
+        settlements = []
+        cycles = sorted({
+            r.get("billing_cycle") for r in list_usage() if r.get("billing_cycle")
+        })
+        for cycle in cycles:
+            record = read_settlement_record(cycle)
+            versions = record.get("versions", [])
+            current = versions[-1] if versions else {}
+            settlements.append({
+                "billing_cycle": cycle,
+                "current_version": record.get("current_version", 0),
+                "settlement_no": current.get("settlement_no"),
+                "total_amount": current.get("total_amount", 0),
+                "reopened": record.get("reopened", False),
+                "reopen_corrections": record.get("reopen_corrections", []),
+                "version_count": len(versions),
+                "versions": [
+                    {
+                        "version": v.get("version"),
+                        "settlement_no": v.get("settlement_no"),
+                        "kind": v.get("kind"),
+                        "previous_total_amount": v.get("previous_total_amount"),
+                        "incremental_amount": v.get("incremental_amount"),
+                        "total_amount": v.get("total_amount"),
+                        "correction_id": v.get("correction_id"),
+                        "settled_at": v.get("settled_at"),
+                    }
+                    for v in versions
+                ],
+            })
+
+        correction_usage = [
+            r for r in list_usage() if r.get("correction_id")
+        ]
         return {
             "module": self.MODULE,
             "entity": self.ENTITY,
@@ -142,4 +213,9 @@ class UsageBillingService(BaseModuleService):
             "usages": usage_list,
             "total_amount": sum(float(r.get("amount", 0) or 0) for r in usage_list),
             "settled_count": sum(1 for r in usage_list if r.get("status") == "已结算"),
+            "settlements": settlements,
+            "correction_usage_count": len(correction_usage),
+            "correction_usage_ids": [
+                f"USAG-{int(r.get('usage_id', 0)):04d}" for r in correction_usage],
+            "notices": len(list_reconciliation_notices()),
         }

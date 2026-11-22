@@ -20,6 +20,7 @@ from app.services.call_audit import CallAuditService
 from app.services.version_compat import VersionCompatService
 from app.services.batch_query import BatchQueryService
 from app.services.sdk_config import SdkConfigService
+from app.services.billing_correction import BillingCorrectionService
 
 SERVICES: dict[str, BaseModuleService] = {
     "api_registry": ApiRegistryService(),
@@ -40,6 +41,7 @@ SERVICES: dict[str, BaseModuleService] = {
     "version_compat": VersionCompatService(),
     "batch_query": BatchQueryService(),
     "sdk_config": SdkConfigService(),
+    "billing_correction": BillingCorrectionService(),
 }
 
 
